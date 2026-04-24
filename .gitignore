@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Generated data files — too large for git
+*.parquet
+companyfacts/
+
+# Generated HTML outputs
+market_manifold.html
+market_manifold_test.html
