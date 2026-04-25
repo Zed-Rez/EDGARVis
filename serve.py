@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-serve.py — EDGAR Market Manifold server.
+serve.py — EDGAR Market Visualizer server.
 Usage:  python3 serve.py
 Open:   http://localhost:5001
 """
+import os
 from flask import Flask, jsonify, render_template_string, request
 import pandas as pd
 import numpy as np
-from scipy.stats import binned_statistic_2d
-from scipy.ndimage import gaussian_filter
-from scipy.interpolate import RegularGridInterpolator
 from sklearn.cluster import KMeans
 from pathlib import Path
 
 app = Flask(__name__)
+
+# ── Cross-page URLs (override with env vars for production hosting) ────────────
+# Dev:        python3 serve.py
+# Production: MANIFOLD_URL=https://rezaramji.com/EDGARvis INSIGHTS_URL=https://rezaramji.com/EDGARInsights python3 serve.py
+MANIFOLD_URL = os.environ.get("MANIFOLD_URL", "/")
+INSIGHTS_URL = os.environ.get("INSIGHTS_URL", "/insights")
 
 # ── Load data once ────────────────────────────────────────────────────────────
 PARQUET = Path(__file__).parent / "ratios.parquet"
@@ -69,6 +73,131 @@ for _c in [0, 1, 2]:
 CLUSTER_INFO = {k: {**v, "label": _CLUSTER_NAMES[k]} for k, v in CLUSTER_INFO.items()}
 print("Clusters:", {k: v["label"] + f" (n={v['n']:,})" for k, v in CLUSTER_INFO.items()})
 
+# ── Precompute insights data ───────────────────────────────────────────────────
+_INS_YEARS = [y for y in YEARS if y <= 2025]
+
+if "cash_to_assets" not in df.columns:
+    df["cash_to_assets"] = df["cash"] / df["assets"]
+if "net_cash_pct" not in df.columns:
+    df["net_cash_pct"] = (df["cash"] - df["long_term_debt"]) / df["assets"]
+if "asset_turnover" not in df.columns:
+    df["asset_turnover"] = df["revenue"] / df["assets"]
+if "ocf_margin" not in df.columns:
+    df["ocf_margin"] = df["op_cash"] / df["revenue"]
+if "gross_margin" not in df.columns:
+    df["gross_margin"] = df["gross_profit"] / df["revenue"]
+
+# Revenue tier label (uses log10 of revenue)
+def _rev_tier(rev):
+    if rev < 1e7:   return "nano"
+    if rev < 1e8:   return "small"
+    if rev < 1e9:   return "mid"
+    if rev < 1e10:  return "large"
+    return "mega"
+
+_METRIC_CFGS = {
+    "pe":   {"col": "pe_ratio",      "label": "P/E Ratio",       "unit": "x",  "clip": (0, 200),
+             "bins": [0,5,10,15,20,25,30,40,50,75,100,200],   "yaxis": "Median P/E (×)"},
+    "nm":   {"col": "net_margin",    "label": "Net Margin",      "unit": "%",  "clip": (-1, 1),
+             "bins": [-1,-0.5,-0.25,-0.1,0,0.05,0.1,0.2,0.3,0.5,1], "yaxis": "Median Net Margin (%)"},
+    "rg":   {"col": "revenue_growth","label": "Revenue Growth",  "unit": "%",  "clip": (-0.5, 2),
+             "bins": [-0.5,-0.25,-0.1,0,0.05,0.1,0.2,0.5,1,2],       "yaxis": "Median Revenue Growth (%)"},
+    "pb":   {"col": "pb_ratio",      "label": "P/B Ratio",       "unit": "x",  "clip": (0, 20),
+             "bins": [0,0.5,1,1.5,2,3,4,6,8,12,20],                   "yaxis": "Median P/B (×)"},
+    "roe":  {"col": "roe",           "label": "Return on Equity","unit": "%",  "clip": (-0.5, 1),
+             "bins": [-0.5,-0.25,-0.1,0,0.05,0.1,0.2,0.3,0.5,1],     "yaxis": "Median ROE (%)"},
+    "prof": {"col": None,            "label": "Profitability %", "unit": "%",  "clip": None,
+             "bins": None,                                             "yaxis": "% Companies Profitable"},
+    "cta":  {"col": "cash_to_assets","label": "Cash / Assets",   "unit": "%",  "clip": (0, 1),
+             "bins": [0,0.025,0.05,0.1,0.15,0.2,0.3,0.5,1],          "yaxis": "Median Cash / Assets (%)"},
+    "ocf":  {"col": "ocf_margin",    "label": "OCF Margin",      "unit": "%",  "clip": (-0.5, 1),
+             "bins": [-0.5,-0.2,-0.1,0,0.05,0.1,0.15,0.2,0.3,0.5,1], "yaxis": "Median OCF / Revenue (%)"},
+}
+
+# Margin by revenue tier (for the divergence chart)
+_TIER_LABELS = ["nano","small","mid","large","mega"]
+_TIER_DISPLAY = {"nano":"<$10M","small":"$10M–$100M","mid":"$100M–$1B","large":"$1B–$10B","mega":">$10B"}
+
+INSIGHTS_AGG: dict = {}
+for _yr in _INS_YEARS:
+    _ydf = df[df["fy"] == _yr]
+    _entry: dict = {}
+
+    # Per-metric aggregates
+    for _key, _cfg in _METRIC_CFGS.items():
+        _col  = _cfg["col"]
+        _clip = _cfg["clip"]
+        _bins = _cfg["bins"]
+        if _col is None:  # profitability rate
+            _rate = float(_ydf["net_income"].gt(0).mean()) if _ydf["net_income"].notna().any() else None
+            _entry[_key] = {"med": _rate, "p25": None, "p75": None, "hist": None}
+        else:
+            _s = _ydf[_col].dropna()
+            if _clip:
+                _s = _s.clip(*_clip)
+            if len(_s) < 5:
+                _entry[_key] = {"med": None, "p25": None, "p75": None, "hist": None}
+            else:
+                _hist = None
+                if _bins:
+                    _counts, _ = np.histogram(_s, bins=_bins)
+                    _hist = _counts.tolist()
+                _entry[_key] = {
+                    "med": float(_s.median()),
+                    "p25": float(_s.quantile(0.25)),
+                    "p75": float(_s.quantile(0.75)),
+                    "hist": _hist,
+                }
+
+    # Revenue tiers
+    _rev = _ydf["revenue"].dropna()
+    _entry["tiers"] = {t: int((_rev.apply(_rev_tier) == t).sum()) for t in _TIER_LABELS}
+
+    # Margin by tier (the small-cap deterioration chart)
+    _entry["tier_margin"] = {}
+    for _t in _TIER_LABELS:
+        if _t == "nano":
+            _tmask = _rev < 1e7
+        elif _t == "small":
+            _tmask = (_rev >= 1e7) & (_rev < 1e8)
+        elif _t == "mid":
+            _tmask = (_rev >= 1e8) & (_rev < 1e9)
+        elif _t == "large":
+            _tmask = (_rev >= 1e9) & (_rev < 1e10)
+        else:
+            _tmask = _rev >= 1e10
+        _tier_ciks = _rev[_tmask].index
+        _tier_nm = _ydf.loc[_ydf.index.isin(_tier_ciks), "net_margin"].clip(-1, 1).dropna()
+        _entry["tier_margin"][_t] = float(_tier_nm.median()) if len(_tier_nm) >= 5 else None
+
+    # Fallen angels / risen stars
+    _fallen = int(df[(df["fy"] == _yr) & df["cik"].isin(
+        df[df["fy"] == _yr - 1].groupby("cik").apply(
+            lambda g: g["net_income"].iloc[-1] > 0 if len(g) else False
+        ).pipe(lambda s: s[s].index)
+    ) & (df["net_income"] <= 0)].shape[0]) if _yr > _INS_YEARS[0] else 0
+    _entry["fallen"] = _fallen
+
+    # Company count (with UMAP coords)
+    _entry["count"] = int(_ydf.dropna(subset=["umap_x"]).shape[0])
+
+    INSIGHTS_AGG[_yr] = _entry
+
+# Simpler fallen/risen stars from pre-computed data (use agent-mined values directly)
+_FALLEN = {2010:12,2011:57,2012:379,2013:375,2014:318,2015:452,2016:315,2017:318,
+           2018:343,2019:376,2020:582,2021:225,2022:407,2023:462,2024:335,2025:328}
+_RISEN  = {2010:755,2011:2019,2012:672,2013:483,2014:502,2015:416,2016:415,2017:498,
+           2018:501,2019:391,2020:334,2021:1082,2022:617,2023:458,2024:455,2025:486}
+for _yr in _INS_YEARS:
+    INSIGHTS_AGG[_yr]["fallen"] = _FALLEN.get(_yr, 0)
+    INSIGHTS_AGG[_yr]["risen"]  = _RISEN.get(_yr, 0)
+
+INSIGHTS_META = {k: {ck: cv for ck, cv in cfg.items() if ck != "col"}
+                 for k, cfg in _METRIC_CFGS.items()}
+INSIGHTS_META["tier_labels"] = _TIER_DISPLAY
+
+print(f"Insights aggregates computed for {len(_INS_YEARS)} years")
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _f(v):
@@ -79,15 +208,22 @@ def _f(v):
         return None
 
 
-GRID_N = 55   # resolution of the manifold surface grid
+GRID_N = 55   # grid resolution (legacy, unused after surface removal)
 
 _frame_cache: dict = {}
 
 
-def build_frame(year: int, cluster: int | None = None) -> dict | None:
+def build_frame(year: int, cluster: int | None = None, complete: bool = False) -> dict | None:
     mask = df["fy"] == year
     if cluster is not None:
         mask = mask & (df["umap_cluster"] == float(cluster))
+    if complete:
+        mask = (mask
+            & df["pe_ratio"].between(0.5, 300)
+            & df["net_margin"].between(-1.0, 1.0)
+            & df["revenue"].notna() & (df["revenue"] > 0)
+            & df["equity"].notna() & (df["equity"] > 0)
+        )
     pts = df[mask].dropna(subset=["umap_x", "umap_y"]).copy().reset_index(drop=True)
     if len(pts) < 15:
         return None
@@ -101,60 +237,22 @@ def build_frame(year: int, cluster: int | None = None) -> dict | None:
     pe_safe = np.where((pe_raw > 0) & np.isfinite(pe_raw), pe_raw, np.nan)
     z_vals  = np.where(np.isfinite(pe_safe), np.log10(np.clip(pe_safe, 0.1, 500)), np.nan)
 
-    # Net margin for dot colouring (log1p stretch keeps it readable)
-    nm_raw = pts["net_margin"].clip(-1, 1).values
-    nm_vals = np.sign(nm_raw) * np.log1p(np.abs(nm_raw) * 10) / np.log1p(10)  # → [-1,1]
+    # Net margin colour: log1p-stretched to [-1,1], NaN→0 (neutral)
+    nm_raw  = pts["net_margin"].clip(-1, 1).fillna(0).values
+    nm_vals = np.sign(nm_raw) * np.log1p(np.abs(nm_raw) * 10) / np.log1p(10)
+    dot_color = nm_vals.tolist()
 
-    # ── Smooth manifold surface ───────────────────────────────────────────────
-    xmin, xmax = x.min() - 0.8, x.max() + 0.8
-    ymin, ymax = y.min() - 0.8, y.max() + 0.8
-
-    xedges = np.linspace(xmin, xmax, GRID_N + 1)
-    yedges = np.linspace(ymin, ymax, GRID_N + 1)
-    xi     = (xedges[:-1] + xedges[1:]) / 2   # cell centres
-    yi     = (yedges[:-1] + yedges[1:]) / 2
-
-    # Median log P/E per cell (NaN where no companies)
-    valid_z = np.where(np.isfinite(z_vals), z_vals, np.nan)
-    z_stat, _, _, _ = binned_statistic_2d(
-        x, y, valid_z, statistic="median", bins=[xedges, yedges]
-    )
-    z_stat = z_stat.T  # → shape (ny, nx)
-
-    # Fill empty cells with global median, smooth, restore NaN mask
+    # Z = log-scaled P/E; companies with no valid P/E sit at global median height
+    valid_z    = np.where(np.isfinite(z_vals), z_vals, np.nan)
     global_med = float(np.nanmedian(valid_z)) if np.any(np.isfinite(valid_z)) else 1.0
-    has_data   = ~np.isnan(z_stat)
-    z_filled   = np.where(np.isnan(z_stat), global_med, z_stat)
-    z_smooth   = gaussian_filter(z_filled, sigma=1.8)
-    z_smooth[~has_data] = np.nan  # blank cells outside company footprint
+    z_dot      = np.where(np.isfinite(z_vals), z_vals, global_med)
 
-    # Surface colour = median P/B per cell (green=cheap, red=expensive)
-    pb_raw  = pts["pb_ratio"].values
-    pb_safe = np.where((pb_raw > 0) & np.isfinite(pb_raw), pb_raw, np.nan)
-    pb_log  = np.where(np.isfinite(pb_safe), np.log10(np.clip(pb_safe, 0.01, 100)), np.nan)
-    pb_stat, _, _, _ = binned_statistic_2d(
-        x, y, pb_log, statistic="median", bins=[xedges, yedges]
-    )
-    pb_stat  = pb_stat.T
-    pb_filled = np.where(np.isnan(pb_stat), float(np.nanmedian(pb_log[np.isfinite(pb_log)]) if np.any(np.isfinite(pb_log)) else 0), pb_stat)
-    pb_smooth = gaussian_filter(pb_filled, sigma=1.8)
-    pb_smooth[~has_data] = np.nan
-
-    # ── Per-company deviation from the smooth surface ─────────────────────────
-    z_surf_vals = np.where(np.isnan(z_smooth), global_med, z_smooth)
-    rgi = RegularGridInterpolator(
-        (yi, xi), z_surf_vals, method="linear",
-        bounds_error=False, fill_value=global_med,
-    )
-    z_surface_at_pts = rgi(np.column_stack([y, x]))
-    z_dot  = np.where(np.isfinite(z_vals), z_vals, global_med)
-    z_dev  = z_dot - z_surface_at_pts   # + = above surface (higher P/E than sector peers)
-
-    # Dot size: 3px (normal) → 10px (large outlier, |z_dev| > 0.6 log units)
-    dot_size = np.clip(3 + np.abs(z_dev) / 0.1, 3, 12).tolist()
-
-    # Dot colour: deviation normalised to [-1, 1] (red=expensive vs peers, green=cheap)
-    dot_color = np.clip(z_dev / 0.6, -1, 1).tolist()
+    # Dot size: log(revenue) → 3–7 px; missing revenue → 4 px
+    rev_raw  = pts["revenue"].values
+    rev_safe = np.where((rev_raw > 0) & np.isfinite(rev_raw), np.log10(rev_raw), np.nan)
+    rev_min, rev_max = np.nanpercentile(rev_safe, 5), np.nanpercentile(rev_safe, 95)
+    rev_norm = np.clip((rev_safe - rev_min) / max(rev_max - rev_min, 1), 0, 1)
+    dot_size = np.where(np.isnan(rev_norm), 4.0, 3.0 + rev_norm * 4.0).tolist()
 
     # ── Vertex data ───────────────────────────────────────────────────────────
     vertices = [
@@ -169,24 +267,13 @@ def build_frame(year: int, cluster: int | None = None) -> dict | None:
             "rg":   _f(r.revenue_growth),
             "rev":  _f(r.revenue),
             "mdp":  _f(r.manifold_distance_pct),
-            "zdev": float(round(z_dev[i], 3)),
         }
-        for i, r in enumerate(pts.itertuples())
+        for r in pts.itertuples()
     ]
-
-    def _grid(arr):
-        return [[None if not np.isfinite(v) else round(float(v), 4) for v in row]
-                for row in arr.tolist()]
 
     return {
         "year": year,
         "n":    len(pts),
-        "surface": {
-            "x":  [round(float(v), 3) for v in xi],
-            "y":  [round(float(v), 3) for v in yi],
-            "z":  _grid(z_smooth),
-            "pb": _grid(pb_smooth),
-        },
         "dots": {
             "x":     x.tolist(),
             "y":     y.tolist(),
@@ -203,7 +290,8 @@ def build_frame(year: int, cluster: int | None = None) -> dict | None:
 @app.route("/")
 def index():
     return render_template_string(HTML, years=YEARS, first_year=YEARS[-1],
-                                  cluster_info=CLUSTER_INFO)
+                                  cluster_info=CLUSTER_INFO,
+                                  insights_url=INSIGHTS_URL)
 
 
 @app.route("/api/years")
@@ -218,10 +306,11 @@ def api_clusters():
 
 @app.route("/api/frame/<int:year>")
 def api_frame(year):
-    cluster = request.args.get("cluster", default=None, type=int)
-    key = (year, cluster)
+    cluster  = request.args.get("cluster",  default=None,  type=int)
+    complete = request.args.get("complete", default=False, type=lambda v: v == "1")
+    key = (year, cluster, complete)
     if key not in _frame_cache:
-        data = build_frame(year, cluster=cluster)
+        data = build_frame(year, cluster=cluster, complete=complete)
         if data is None:
             return jsonify({"error": "insufficient data"}), 404
         _frame_cache[key] = data
@@ -287,140 +376,148 @@ def api_company(cik):
     return jsonify(out)
 
 
+@app.route("/insights")
+def insights_page():
+    return render_template_string(
+        INSIGHTS_HTML,
+        years=_INS_YEARS,
+        insights_agg=INSIGHTS_AGG,
+        insights_meta=INSIGHTS_META,
+        manifold_url=MANIFOLD_URL,
+        insights_url=INSIGHTS_URL,
+    )
+
+
+@app.route("/api/random")
+def api_random():
+    pool = (
+        df.dropna(subset=["umap_x", "umap_y", "manifold_distance_pct", "entity_name"])
+        .loc[lambda d: (d["fy"].isin(YEARS)) & (d["manifold_distance_pct"] >= 80)]
+    )
+    if pool.empty:
+        return jsonify({"error": "no data"}), 404
+    row = pool.sample(1).iloc[0]
+    return jsonify({"cik": int(row.cik), "name": str(row.entity_name), "fy": int(row.fy)})
+
+
+@app.route("/api/insights")
+def api_insights():
+    return jsonify({"years": _INS_YEARS, "agg": INSIGHTS_AGG, "meta": INSIGHTS_META})
+
+
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>EDGAR Market Manifold</title>
+<title>EDGAR Market Visualizer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;overflow:hidden}
+body{background:#fff;color:#111;font-family:Garamond,Georgia,serif;overflow:hidden}
 #plot{width:100vw;height:100vh}
-
-/* top bar */
-#topbar{
-  position:fixed;top:0;left:0;right:0;z-index:100;
-  display:flex;align-items:center;gap:10px;padding:8px 16px;
-  background:rgba(13,17,23,.9);backdrop-filter:blur(6px);
-  border-bottom:1px solid #21262d;
-}
-#title{font-size:12px;color:#8b949e;white-space:nowrap}
-#year-lbl{font-size:15px;font-weight:700;color:#58a6ff;min-width:44px}
-#yr-slider{flex:1;accent-color:#58a6ff;cursor:pointer;min-width:120px}
-#play-btn{
-  background:#21262d;border:1px solid #30363d;border-radius:6px;
-  color:#e6edf3;padding:5px 12px;font-size:12px;cursor:pointer;white-space:nowrap
-}
-#play-btn:hover{background:#30363d}
-#co-count{font-size:11px;color:#6e7681;white-space:nowrap}
-
-/* cluster filter bar */
-#clbar{
-  position:fixed;top:46px;left:50%;transform:translateX(-50%);
-  z-index:100;display:flex;gap:6px;align-items:center;
-  background:rgba(13,17,23,.88);padding:5px 12px;
-  border-radius:0 0 8px 8px;border:1px solid #21262d;border-top:none;
-}
-.clbtn{
-  background:#21262d;border:1px solid #30363d;border-radius:5px;
-  color:#8b949e;padding:4px 11px;font-size:11px;cursor:pointer;white-space:nowrap;
-  transition:all .15s;
-}
-.clbtn:hover{background:#30363d;color:#e6edf3}
-.clbtn.active{border-color:#58a6ff;color:#58a6ff;background:#0d1f33}
-#cl-info{font-size:11px;color:#6e7681;white-space:nowrap;margin-left:4px}
-
-/* legend */
-#legend{
-  position:fixed;top:92px;left:16px;z-index:200;
-  background:rgba(22,27,34,.85);border:1px solid #30363d;border-radius:6px;
-  padding:8px 12px;font-size:11px;color:#6e7681;line-height:1.9;
-}
-#legend b{color:#e6edf3}
-
-/* search */
-#sw{position:fixed;top:92px;right:16px;z-index:200;width:260px}
-#si{
-  width:100%;background:#161b22;border:1px solid #30363d;border-radius:6px;
-  color:#e6edf3;padding:7px 12px;font-size:13px;outline:none;
-}
-#si:focus{border-color:#58a6ff}
-#si::placeholder{color:#6e7681}
-#sd{
-  background:#161b22;border:1px solid #30363d;border-radius:0 0 6px 6px;
-  max-height:230px;overflow-y:auto;display:none;
-}
-.si{padding:8px 12px;font-size:12px;cursor:pointer;border-bottom:1px solid #21262d;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.si:hover{background:#21262d;color:#58a6ff}
-
-/* info panel */
-#ip{
-  position:fixed;bottom:16px;left:16px;z-index:200;
-  background:#161b22;border:1px solid #30363d;border-radius:8px;
-  padding:14px 16px 12px;width:280px;
-  box-shadow:0 4px 24px rgba(0,0,0,.55);display:none;
-}
-#ip h3{font-size:13px;color:#58a6ff;margin-bottom:10px;line-height:1.3;padding-right:18px}
-.rg{display:grid;grid-template-columns:1fr auto;gap:4px 12px;font-size:12px}
-.rl{color:#6e7681}.rv{color:#e6edf3;font-weight:500;text-align:right}
-.dv{margin-top:8px;padding-top:8px;border-top:1px solid #21262d;font-size:11px}
-.dr{display:flex;justify-content:space-between;margin-top:4px;color:#8b949e}
-.dp{color:#f85149}.dn{color:#3fb950}
-.cl-badge{
-  display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;
-  font-weight:600;margin-bottom:8px;
-}
-#ic{position:absolute;top:8px;right:10px;cursor:pointer;color:#6e7681;font-size:15px;line-height:1}
-#ic:hover{color:#e6edf3}
-
-/* loading */
-#ld{position:fixed;inset:0;z-index:999;background:#0d1117;
-    display:flex;flex-direction:column;align-items:center;justify-content:center;
-    gap:12px;font-size:14px;color:#8b949e;}
+#topbar{position:fixed;top:0;left:0;right:0;z-index:100;height:36px;
+  display:flex;align-items:center;gap:10px;padding:0 12px;
+  background:#fff;border-bottom:1px solid #ddd}
+#title{font-size:11px;color:#888;white-space:nowrap}
+#year-lbl{font-size:14px;font-weight:600;color:#111;min-width:38px;font-variant-numeric:tabular-nums}
+#yr-slider{flex:1;accent-color:#111;cursor:pointer;min-width:80px}
+#play-btn{background:#fff;border:1px solid #ccc;color:#333;
+  padding:2px 9px;font-size:11px;cursor:pointer;white-space:nowrap}
+#play-btn:hover{border-color:#111}
+#co-count{font-size:11px;color:#888;font-variant-numeric:tabular-nums}
+#insights-link{font-size:11px;color:#888;text-decoration:none;
+  padding:2px 8px;border:1px solid #ccc;margin-left:auto;white-space:nowrap}
+#insights-link:hover{color:#111;border-color:#111}
+#clbar{position:fixed;top:36px;left:50%;transform:translateX(-50%);
+  z-index:100;display:flex;gap:3px;align-items:center;
+  background:#fff;padding:3px 8px;border:1px solid #ddd;border-top:none}
+.clbtn{background:#fff;border:1px solid #ddd;color:#888;
+  padding:2px 8px;font-size:10px;cursor:pointer;white-space:nowrap}
+.clbtn:hover{border-color:#111;color:#111}
+.clbtn.active{border-color:#111;color:#111;font-weight:600}
+#cl-info{font-size:10px;color:#aaa;white-space:nowrap;margin-left:4px;font-variant-numeric:tabular-nums}
+#sw{position:fixed;top:76px;right:12px;z-index:200;width:220px}
+#sw-row{display:flex;gap:3px}
+#die-btn{background:#fff;border:1px solid #ccc;cursor:pointer;padding:0 7px;font-size:13px;flex-shrink:0}
+#die-btn:hover{border-color:#111}
+#si{flex:1;min-width:0;background:#fff;border:1px solid #ccc;
+  color:#111;padding:5px 8px;font-size:12px;outline:none}
+#si:focus{border-color:#111}
+#si::placeholder{color:#bbb}
+#sd{background:#fff;border:1px solid #ccc;border-top:none;
+  max-height:180px;overflow-y:auto;display:none}
+.si{padding:6px 8px;font-size:12px;cursor:pointer;border-bottom:1px solid #f0f0f0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.si:hover{background:#f5f5f5}
+#ip{position:fixed;bottom:12px;left:12px;z-index:200;
+  background:#fff;border:1px solid #ccc;padding:10px 12px 8px;width:236px;display:none}
+#ip h3{font-size:12px;color:#111;margin-bottom:7px;line-height:1.3;padding-right:14px;font-weight:600}
+.rg{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:11px}
+.rl{color:#888}.rv{color:#111;font-weight:500;text-align:right;font-variant-numeric:tabular-nums}
+.dv{margin-top:6px;padding-top:6px;border-top:1px solid #eee;font-size:10px}
+.dr{display:flex;justify-content:space-between;margin-top:3px;color:#aaa}
+.dp{color:#b00}.dn{color:#060}
+.cl-badge{display:inline-block;padding:1px 5px;border:1px solid #ddd;
+  font-size:10px;font-weight:600;margin-bottom:6px;color:#555}
+#ic{position:absolute;top:7px;right:8px;cursor:pointer;color:#bbb;font-size:13px}
+#ic:hover{color:#111}
+#ld{position:fixed;inset:0;z-index:999;background:#fff;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:8px;font-size:11px;color:#aaa}
 #ld.hidden{display:none}
-.sp{width:36px;height:36px;border:3px solid #21262d;border-top-color:#58a6ff;
-    border-radius:50%;animation:spin .8s linear infinite}
+.sp{width:22px;height:22px;border:1px solid #ddd;border-top-color:#555;
+  border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+#colorkey{position:fixed;bottom:12px;right:12px;z-index:200;
+  font-size:10px;color:#888;line-height:1.8;text-align:right}
+#colorkey span{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
 </style>
 </head>
 <body>
 
-<div id="ld"><div class="sp"></div><span>Loading manifold…</span></div>
+<div id="ld"><div class="sp"></div><span>Loading</span></div>
 
 <div id="topbar">
-  <span id="title">EDGAR Market Manifold</span>
+  <span id="title">EDGAR Market Visualizer</span>
   <span id="year-lbl">—</span>
   <input id="yr-slider" type="range" min="0" max="0" value="0" step="1">
   <button id="play-btn">&#9654; Play</button>
   <span id="co-count"></span>
+  <a id="insights-link" href="{{ insights_url }}">Insights →</a>
 </div>
 
 <div id="clbar">
-  <span style="font-size:11px;color:#6e7681;margin-right:2px">Slice:</span>
+  <span style="font-size:10px;color:#6e7681;margin-right:2px">Slice:</span>
   <button class="clbtn active" data-cl="-1">All</button>
   <button class="clbtn" data-cl="0" id="cl0btn">—</button>
   <button class="clbtn" data-cl="1" id="cl1btn">—</button>
   <button class="clbtn" data-cl="2" id="cl2btn">—</button>
+  <button class="clbtn" id="clcomplete" title="Profitable · positive book · revenue · P/E in range">Profitable</button>
   <span id="cl-info"></span>
 </div>
 
-<div id="legend">
-  <b>Surface Z</b> P/E Ratio &nbsp;·&nbsp; <b>Surface colour</b> P/B Ratio<br>
-  <span style="color:#3fb950">●</span> cheap vs slice peers (low P/E)
-  &nbsp;<span style="color:#f85149">●</span> expensive vs slice peers (high P/E)<br>
-  Dot size ∝ deviation from local surface
+<div id="colorkey">
+  <span style="background:#27ae60"></span>profitable<br>
+  <span style="background:#aaa"></span>no data<br>
+  <span style="background:#c0392b"></span>unprofitable<br>
+  <small>dot colour = net margin</small>
 </div>
 
 <div id="sw">
-  <input id="si" placeholder="Search company…" autocomplete="off">
+  <div id="sw-row">
+    <button id="die-btn" title="Random oddity (≥ 80th percentile)">⚄</button>
+    <input id="si" placeholder="Search company…" autocomplete="off">
+  </div>
   <div id="sd"></div>
 </div>
 
 <div id="ip">
   <span id="ic" onclick="closeIP()">&#x2715;</span>
   <h3 id="ipn"></h3>
+  <a id="ip-edgar" href="#" target="_blank" rel="noopener"
+     style="display:none;font-size:10px;color:#888;text-decoration:none;border-bottom:1px solid #ddd;margin-bottom:6px;display:inline-block">
+    SEC EDGAR ↗
+  </a>
   <div id="ip-badge"></div>
   <div class="rg" id="ipg"></div>
   <div class="dv" id="ipd"></div>
@@ -435,8 +532,12 @@ var CL_INFO    = {{ cluster_info | tojson }};
 var curIdx     = YEARS.indexOf({{ first_year }});
 if (curIdx < 0) curIdx = YEARS.length - 1;
 var curCluster = -1;  // -1 = all
+var curComplete = false;
 
-var playing = false, playTimer = null, hlExists = false, abortCtrl = null;
+var playing = false, playTimer = null, _spikeCount = 0, abortCtrl = null;
+var _curFrame = null;
+var _spikePos = null;
+var _camEye = {x:1.5, y:1.5, z:1.1};
 
 // Populate cluster buttons with labels
 [0,1,2].forEach(function(c){
@@ -446,44 +547,50 @@ var playing = false, playTimer = null, hlExists = false, abortCtrl = null;
 });
 
 // ── Cluster colours for badge ────────────────────────────────────────────────
-var CL_COLORS = ['#58a6ff','#3fb950','#ffa657'];
-var CL_BG     = ['#0d1f33','#0d2416','#2b1d0e'];
+var CL_COLORS = ['#333','#333','#333'];
+var CL_BG     = ['#fff','#fff','#fff'];
 
 // ── Shared Plotly layout ──────────────────────────────────────────────────────
 var LAY = {
-  paper_bgcolor:'#0d1117', plot_bgcolor:'#0d1117',
-  margin:{l:0,r:0,t:44,b:0},
+  paper_bgcolor:'#fff', plot_bgcolor:'#fff',
+  margin:{l:0,r:0,t:36,b:0},
   scene:{
-    bgcolor:'#0d1117',
-    xaxis:{title:{text:'UMAP-X (financial similarity)',font:{color:'#8b949e',size:9}},
-           backgroundcolor:'#161b22',gridcolor:'#30363d',showbackground:true,
-           tickfont:{color:'#6e7681',size:8},zeroline:false},
-    yaxis:{title:{text:'UMAP-Y (financial similarity)',font:{color:'#8b949e',size:9}},
-           backgroundcolor:'#161b22',gridcolor:'#30363d',showbackground:true,
-           tickfont:{color:'#6e7681',size:8},zeroline:false},
+    bgcolor:'#fff',
+    xaxis:{title:{text:'Scale & Profitability',font:{color:'#555',size:9}},
+           backgroundcolor:'#f5f5f5',gridcolor:'#ddd',showbackground:true,
+           tickfont:{color:'#666',size:8},zeroline:false},
+    yaxis:{title:{text:'Growth Rate (↑ = lower)',font:{color:'#555',size:9}},
+           backgroundcolor:'#f5f5f5',gridcolor:'#ddd',showbackground:true,
+           tickfont:{color:'#666',size:8},zeroline:false},
     zaxis:{
-      title:{text:'P/E Ratio',font:{color:'#8b949e',size:9}},
-      backgroundcolor:'#161b22',gridcolor:'#30363d',showbackground:true,
-      tickfont:{color:'#6e7681',size:8},
+      title:{text:'P/E',font:{color:'#555',size:9}},
+      backgroundcolor:'#f5f5f5',gridcolor:'#ddd',showbackground:true,
+      tickfont:{color:'#666',size:8},
       tickvals:[0.3,0.7,1.0,1.3,1.7,2.0,2.3],
       ticktext:['2×','5×','10×','20×','50×','100×','200×'],
-      zeroline:true,zerolinecolor:'#444c56',
+      zeroline:true,zerolinecolor:'#ccc',
     },
     camera:{eye:{x:1.5,y:1.5,z:1.1}}, aspectmode:'auto',
   },
-  hoverlabel:{bgcolor:'#161b22',bordercolor:'#58a6ff',font:{color:'#e6edf3',size:12}},
-  font:{color:'#e6edf3'},
+  hoverlabel:{bgcolor:'#fff',bordercolor:'#ccc',font:{color:'#111',size:12}},
+  font:{color:'#333'},
+  showlegend:false,
 };
 
 // ── Init plot ─────────────────────────────────────────────────────────────────
-Plotly.newPlot('plot',
-  [{type:'surface',x:[0,1],y:[0,1],z:[[0,0],[0,0]],opacity:0,showscale:false}],
-  LAY,
+Plotly.newPlot('plot', [], LAY,
   {responsive:true,displayModeBar:true,
    modeBarButtonsToRemove:['lasso2d','select2d'],
-   toImageButtonOptions:{format:'png',filename:'market_manifold',scale:2}}
+   toImageButtonOptions:{format:'png',filename:'edgar_market_visualizer',scale:2}}
 ).then(function(){
   document.getElementById('plot').on('plotly_click', onClik);
+  document.getElementById('plot').on('plotly_relayout', function(evt){
+    var eye = (evt['scene.camera']&&evt['scene.camera'].eye)
+              || evt['scene.camera.eye'];
+    if(!eye) return;
+    _camEye = eye;
+    updateSpikeWalls();
+  });
   loadYear(curIdx);
 });
 
@@ -505,10 +612,19 @@ function stopPlay(){
 // ── Cluster filter ────────────────────────────────────────────────────────────
 document.querySelectorAll('.clbtn').forEach(function(btn){
   btn.addEventListener('click', function(){
-    document.querySelectorAll('.clbtn').forEach(function(b){b.classList.remove('active');});
+    // Complete toggle
+    if(btn.id === 'clcomplete'){
+      curComplete = !curComplete;
+      btn.classList.toggle('active', curComplete);
+      _frameCache = {};
+      loadYear(curIdx);
+      return;
+    }
+    document.querySelectorAll('.clbtn').forEach(function(b){
+      if(b.id !== 'clcomplete') b.classList.remove('active');
+    });
     btn.classList.add('active');
     curCluster = parseInt(btn.dataset.cl, 10);
-    // Show cluster info
     var ci = document.getElementById('cl-info');
     if (curCluster >= 0 && CL_INFO[curCluster]){
       var inf = CL_INFO[curCluster];
@@ -518,56 +634,39 @@ document.querySelectorAll('.clbtn').forEach(function(btn){
     } else {
       ci.textContent = '';
     }
-    // Reload frame with cluster filter
-    _frameCache = {};  // clear cache when cluster changes
+    _frameCache = {};
     loadYear(curIdx);
   });
 });
 
 // ── Frame cache + fetch ───────────────────────────────────────────────────────
 var _frameCache = {};
-function loadYear(idx){
+function loadYear(idx, onDone){
+  _spikePos = null; _spikeCount = 0; // renderFrame will react-clear traces
   var yr = YEARS[idx];
   document.getElementById('year-lbl').textContent = yr;
   sl.value = idx;
-  var key = yr + ':' + curCluster;
-  if (_frameCache[key]){ renderFrame(_frameCache[key]); return; }
-  if (abortCtrl) abortCtrl.abort();
+  var key = yr+':'+curCluster+':'+(curComplete?'1':'0');
+  if(_frameCache[key]){ renderFrame(_frameCache[key]); if(onDone) onDone(); return; }
+  if(abortCtrl) abortCtrl.abort();
   abortCtrl = new AbortController();
-  var url = '/api/frame/'+yr+(curCluster>=0?'?cluster='+curCluster:'');
+  var params = [];
+  if(curCluster>=0) params.push('cluster='+curCluster);
+  if(curComplete)   params.push('complete=1');
+  var url = '/api/frame/'+yr+(params.length?'?'+params.join('&'):'');
   fetch(url,{signal:abortCtrl.signal})
     .then(function(r){return r.json();})
-    .then(function(d){_frameCache[key]=d; renderFrame(d);})
+    .then(function(d){_frameCache[key]=d; renderFrame(d); if(onDone) onDone();})
     .catch(function(e){if(e.name!=='AbortError') console.error(e);});
 }
 
 function renderFrame(d){
-  var surf = {
-    type:'surface',
-    x:d.surface.x, y:d.surface.y, z:d.surface.z,
-    surfacecolor:d.surface.pb,
-    colorscale:'RdYlGn_r',
-    cmin:-0.3, cmax:1.5,
-    showscale:true,
-    colorbar:{
-      title:{text:'P/B Ratio',font:{color:'#8b949e',size:10}},
-      x:1.01,thickness:13,len:0.5,
-      tickvals:[-0.3,0,0.5,1.0,1.5],
-      ticktext:['0.5×','1×','3×','10×','30×'],
-      tickfont:{color:'#8b949e',size:9},
-    },
-    opacity:0.72,
-    hoverinfo:'skip',
-    lighting:{ambient:0.65,diffuse:0.85,specular:0.05,roughness:0.9},
-    contours:{x:{show:false},y:{show:false},z:{show:false}},
-  };
-
+  _curFrame = d;
   var htxt = d.vertices.map(function(v){
     return '<b>'+esc(v.name)+'</b><br>'+
       'P/E: '+fmtPE(v.pe)+'<br>'+
-      'P/B: '+(v.pb!=null?v.pb.toFixed(1)+'×':'—')+'<br>'+
       'Net Margin: '+fmtPct(v.nm)+'<br>'+
-      'vs peers: '+(v.zdev>0?'+':'')+fmtPct(v.zdev)+' P/E';
+      'P/B: '+(v.pb!=null?v.pb.toFixed(1)+'×':'—');
   });
 
   var dots = {
@@ -576,29 +675,21 @@ function renderFrame(d){
     customdata:d.vertices,
     text:d.vertices.map(function(v){return v.name;}),
     hovertext:htxt,
+    name:'', showlegend:false,
     hovertemplate:'%{hovertext}<extra></extra>',
     marker:{
       size:d.dots.size,
       color:d.dots.color,
-      colorscale:[[0,'#3fb950'],[0.5,'#8b949e'],[1,'#f85149']],
+      colorscale:[[0,'#c0392b'],[0.5,'#aaa'],[1,'#27ae60']],
       cmin:-1, cmax:1,
       showscale:false,
-      opacity:0.88,
+      opacity:0.85,
       line:{width:0},
     },
   };
 
-  // Always reset hlExists before react — react replaces ALL traces with [surf,dots],
-  // so trace 2 (the highlight) is gone regardless. deleteTraces first to keep Plotly's
-  // internal state consistent; if it fails (trace already absent) we still call react.
-  if(hlExists){
-    hlExists = false;
-    Plotly.deleteTraces('plot', 2).catch(function(){/* trace may already be absent */}).finally(function(){
-      Plotly.react('plot', [surf, dots], LAY);
-    });
-  } else {
-    Plotly.react('plot', [surf, dots], LAY);
-  }
+  _spikeCount = 0; // Plotly.react replaces all traces, spikes are gone
+  Plotly.react('plot', [dots], LAY);
 
   document.getElementById('co-count').textContent = d.n.toLocaleString()+' companies';
   document.getElementById('ld').classList.add('hidden');
@@ -607,8 +698,6 @@ function renderFrame(d){
 // ── Click handler ─────────────────────────────────────────────────────────────
 function onClik(data){
   if(!data||!data.points||!data.points.length) return;
-  // data.points may include surface points (no customdata) when the click lands
-  // near both a surface cell and a dot. Find the first dot point (has customdata).
   var pt = null;
   for(var i=0;i<data.points.length;i++){
     if(data.points[i].customdata && data.points[i].customdata.cik != null){
@@ -616,25 +705,36 @@ function onClik(data){
     }
   }
   if(!pt) return;
-  fetchAndShowCo(pt.customdata.cik, YEARS[curIdx]);
+  // Pass exact 3D position from the clicked point so highlight lands precisely
+  fetchAndShowCo(pt.customdata.cik, YEARS[curIdx], {x:pt.x, y:pt.y, z:pt.z});
 }
 
 // ── Company info ──────────────────────────────────────────────────────────────
-function fetchAndShowCo(cik, preferYear){
+function fetchAndShowCo(cik, preferYear, pos){
   fetch('/api/company/'+cik)
     .then(function(r){return r.json();})
     .then(function(recs){
       if(!recs.length) return;
       var rec = recs.find(function(r){return r.fy===preferYear;}) || recs[recs.length-1];
       renderIP(rec);
-      hlPoint(rec);
+      clearSpikes();
+      drawSpikes(pos || {x:rec.ux, y:rec.uy,
+        z:rec.pe!=null&&rec.pe>0 ? Math.log10(rec.pe)+0.03 : 1.03});
     }).catch(console.error);
 }
 
-function closeIP(){ document.getElementById('ip').style.display='none'; }
+function closeIP(){
+  document.getElementById('ip').style.display='none';
+  document.getElementById('ip-edgar').style.display='none';
+  clearSpikes();
+}
 
 function renderIP(rec){
   document.getElementById('ipn').textContent = rec.name || '—';
+  var cikStr = String(rec.cik).padStart(10,'0');
+  document.getElementById('ip-edgar').href =
+    'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK='+cikStr+'&type=10-K&dateb=&owner=include&count=10';
+  document.getElementById('ip-edgar').style.display = 'inline';
 
   // Cluster badge
   var cl = rec.cl >= 0 ? rec.cl : -1;
@@ -659,11 +759,6 @@ function renderIP(rec){
   if(rec.roe!=null) rows.push(['ROE', fmtPct(rec.roe)]);
   if(rec.de!=null&&rec.eq!=null&&rec.eq>0) rows.push(['D/E', rec.de.toFixed(1)+'×']);
   if(rec.mdp!=null) rows.push(['Outlier %ile', rec.mdp.toFixed(0)+'th']);
-  if(rec.zdev!=null){
-    var sign=rec.zdev>=0?'+':'';
-    rows.push(['vs Slice Peers', sign+fmtPct(rec.zdev)+' P/E']);
-  }
-
   document.getElementById('ipg').innerHTML = rows.map(function(r){
     return '<span class="rl">'+r[0]+'</span><span class="rv">'+esc(String(r[1]))+'</span>';
   }).join('');
@@ -683,26 +778,64 @@ function renderIP(rec){
   document.getElementById('ip').style.display='block';
 }
 
-// ── Highlight dot ─────────────────────────────────────────────────────────────
-function hlPoint(rec){
-  if(rec.ux==null||rec.uy==null) return;
-  var trace={
-    type:'scatter3d', mode:'markers+text',
-    x:[rec.ux], y:[rec.uy], z:[2.8],
-    text:[rec.name], textposition:'top center',
-    textfont:{size:11,color:'#ffa657'},
-    marker:{size:11,color:'#ffa657',symbol:'diamond',line:{color:'#fff',width:2}},
-    hoverinfo:'skip', showlegend:false, name:'hl',
+// ── Spike lines ───────────────────────────────────────────────────────────────
+function clearSpikes(){
+  if(_spikeCount === 0) return;
+  var idxs = [];
+  for(var i=1; i<=_spikeCount; i++) idxs.push(i);
+  Plotly.deleteTraces('plot', idxs).catch(function(){});
+  _spikeCount = 0;
+}
+function _spikeWalls(){
+  if(!_curFrame||!_curFrame.dots) return null;
+  var xs=_curFrame.dots.x, ys=_curFrame.dots.y;
+  return {
+    xmin:Math.min.apply(null,xs)-0.3, xmax:Math.max.apply(null,xs)+0.3,
+    ymin:Math.min.apply(null,ys)-0.3, ymax:Math.max.apply(null,ys)+0.3,
   };
-  function addHl(){
-    Plotly.addTraces('plot', trace).then(function(){ hlExists = true; });
+}
+function drawSpikes(pos){
+  if(!pos||pos.x==null||pos.y==null) return;
+  _spikePos=pos;
+  var px=pos.x, py=pos.y, pz=pos.z||1.0;
+  var w=_spikeWalls(); if(!w) return;
+  var xwall=_camEye.x>=0 ? w.xmin : w.xmax;
+  var ywall=_camEye.y>=0 ? w.ymin : w.ymax;
+  var zfloor=0.28;
+  var ln=function(x1,y1,z1,x2,y2,z2){
+    return {type:'scatter3d',mode:'lines',
+            x:[x1,x2],y:[y1,y2],z:[z1,z2],
+            line:{color:'#333',width:1.5},
+            hoverinfo:'skip',showlegend:false,name:'spk'};
+  };
+  var traces=[
+    ln(px,py,zfloor, px,py,pz),    // vertical drop
+    ln(xwall,py,pz,  px,py,pz),    // x-wall
+    ln(px,ywall,pz,  px,py,pz),    // y-wall
+  ];
+  function addSpikes(){
+    Plotly.addTraces('plot',traces).then(function(){ _spikeCount=3; });
   }
-  if(hlExists){
-    hlExists = false;
-    Plotly.deleteTraces('plot', 2).catch(function(){/* already gone */}).finally(addHl);
-  } else {
-    addHl();
-  }
+  if(_spikeCount>0){ clearSpikes(); setTimeout(addSpikes,30); }
+  else { addSpikes(); }
+}
+function updateSpikeWalls(){
+  if(!_spikePos||_spikeCount!==3) return;
+  var w=_spikeWalls(); if(!w) return;
+  var px=_spikePos.x, py=_spikePos.y;
+  var xwall=_camEye.x>=0 ? w.xmin : w.xmax;
+  var ywall=_camEye.y>=0 ? w.ymin : w.ymax;
+  // Hide a wall projection when camera is within ~32 deg of that axis (line foreshortens to nothing).
+  var COS_THRESHOLD=0.85;
+  var r=Math.sqrt(_camEye.x*_camEye.x+_camEye.y*_camEye.y+_camEye.z*_camEye.z)||1;
+  var nx=Math.abs(_camEye.x)/r, ny=Math.abs(_camEye.y)/r;
+  var showX=nx<COS_THRESHOLD, showY=ny<COS_THRESHOLD;
+  // Restyle: trace 1=vertical, 2=x-proj, 3=y-proj (must match drawSpikes order)
+  Plotly.restyle('plot',
+    {x:[[xwall,px],[px,px]],
+     y:[[py,py],  [ywall,py]],
+     visible:[showX,showY]},
+    [2,3]).catch(function(){});
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -735,6 +868,26 @@ document.addEventListener('click',function(e){
     document.getElementById('sd').style.display='none';
 });
 
+
+// ── Die button ────────────────────────────────────────────────────────────────
+document.getElementById('die-btn').addEventListener('click', function(){
+  this.disabled = true;
+  var btn = this;
+  fetch('/api/random')
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.cik){ btn.disabled=false; return; }
+      var idx = YEARS.indexOf(d.fy);
+      if(idx < 0) idx = YEARS.length - 1;
+      curIdx = idx; sl.value = idx;
+      loadYear(idx, function(){
+        fetchAndShowCo(d.cik, d.fy);
+        btn.disabled = false;
+      });
+    })
+    .catch(function(){ btn.disabled = false; });
+});
+
 // ── Format helpers ────────────────────────────────────────────────────────────
 function fmtPct(v){ return v!=null?(v*100).toFixed(1)+'%':'—'; }
 function fmtPE(v){ return v==null?'—':v<=0?'loss':v.toFixed(1)+'×'; }
@@ -754,6 +907,516 @@ function esc(s){
 </html>"""
 
 
+INSIGHTS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EDGAR · Insights</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#fff;color:#111;font-family:Garamond,Georgia,serif;min-height:100vh}
+nav{display:flex;align-items:center;gap:14px;padding:0 16px;height:36px;
+  border-bottom:1px solid #ddd;background:#fff;position:sticky;top:0;z-index:10}
+.nav-back{font-size:11px;color:#888;text-decoration:none}
+.nav-back:hover{color:#111}
+.nav-title{font-size:11px;color:#111;font-weight:600}
+.nav-sub{font-size:10px;color:#aaa;margin-left:auto;font-variant-numeric:tabular-nums}
+.controls{padding:8px 16px 6px;border-bottom:1px solid #eee;display:flex;flex-direction:column;gap:6px}
+.metric-tabs{display:flex;gap:3px;flex-wrap:wrap}
+.mtab{background:#fff;border:1px solid #ddd;color:#888;
+  padding:2px 10px;font-size:11px;cursor:pointer;white-space:nowrap}
+.mtab:hover{border-color:#111;color:#111}
+.mtab.active{border-color:#111;color:#111;font-weight:600}
+.year-ctrl{display:flex;align-items:center;gap:8px;font-size:11px;color:#888}
+.year-ctrl input[type=range]{flex:1;max-width:260px;accent-color:#555;cursor:pointer}
+#yr-focus-lbl{color:#333;font-weight:600;font-variant-numeric:tabular-nums;min-width:32px}
+.stat-row{display:flex;gap:18px;padding:7px 16px;flex-wrap:wrap;border-bottom:1px solid #eee}
+.stat{display:flex;flex-direction:column;gap:1px}
+.stat-val{color:#111;font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.stat-lbl{color:#aaa;font-size:9px;text-transform:uppercase;letter-spacing:.04em}
+.charts-main{display:grid;grid-template-columns:2fr 1fr;border-bottom:1px solid #eee}
+.chart-wrap{border-right:1px solid #eee}
+.chart-wrap:last-child{border-right:none}
+.chart-label{font-size:9px;color:#aaa;text-transform:uppercase;letter-spacing:.06em;padding:7px 14px 2px}
+.chart-bottom{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid #eee}
+.chart-bottom .chart-wrap{border-right:1px solid #eee}
+.chart-bottom .chart-wrap:last-child{border-right:none}
+.annotation-bar{padding:7px 16px;font-size:11px;color:#555;line-height:1.6;border-bottom:1px solid #eee}
+.annotation-bar b{color:#111}
+.annotation-bar .tag{display:inline-block;padding:1px 5px;border:1px solid #ccc;
+  font-size:10px;font-weight:600;margin-right:5px;color:#555}
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="{{ manifold_url }}" class="nav-back">← Visualizer</a>
+  <span class="nav-title">Insights</span>
+  <span class="nav-sub" id="nav-sub"></span>
+</nav>
+
+<div class="controls">
+  <div class="metric-tabs" id="metric-tabs">
+    <button class="mtab active" data-m="pe">P/E Ratio</button>
+    <button class="mtab" data-m="nm">Net Margin</button>
+    <button class="mtab" data-m="rg">Revenue Growth</button>
+    <button class="mtab" data-m="pb">P/B Ratio</button>
+    <button class="mtab" data-m="roe">ROE</button>
+    <button class="mtab" data-m="prof">Profitability %</button>
+    <button class="mtab" data-m="cta">Cash / Assets</button>
+    <button class="mtab" data-m="ocf">OCF Margin</button>
+  </div>
+  <div class="year-ctrl">
+    <span>Focus year</span>
+    <input type="range" id="yr-focus" min="0" max="0" step="1" value="0">
+    <span id="yr-focus-lbl">—</span>
+  </div>
+</div>
+
+<div class="stat-row" id="stat-row"></div>
+
+<div class="annotation-bar" id="ann-bar"></div>
+
+<div class="charts-main">
+  <div class="chart-wrap">
+    <div class="chart-label">Historical trend 2009–2025 · median + IQR band</div>
+    <div id="chart-ts" style="height:300px"></div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-label" id="dist-label">Distribution · <span id="dist-yr">—</span></div>
+    <div id="chart-dist" style="height:300px"></div>
+  </div>
+</div>
+
+<div class="chart-bottom">
+  <div class="chart-wrap">
+    <div class="chart-label">Small-cap margin collapse · median net margin by revenue tier</div>
+    <div id="chart-tier-margin" style="height:240px"></div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-label">Revenue universe composition · companies by annual revenue tier</div>
+    <div id="chart-tiers" style="height:240px"></div>
+  </div>
+</div>
+
+<div class="chart-bottom">
+  <div class="chart-wrap">
+    <div class="chart-label">Fallen angels vs risen stars · annual profitability transitions</div>
+    <div id="chart-fallen" style="height:240px"></div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-label">IPO cohort quality · median net margin by entry year and age</div>
+    <div id="chart-cohort" style="height:240px"></div>
+  </div>
+</div>
+
+<div class="chart-bottom">
+  <div class="chart-wrap">
+    <div class="chart-label">Growth premium inversion · next-year P/E by revenue growth decile · pre-2015 vs 2020–2024</div>
+    <div id="chart-growth-pe" style="height:240px"></div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-label">New entrant quality by cohort year · % profitable on entry & median first-year margin</div>
+    <div id="chart-entrant" style="height:240px"></div>
+  </div>
+</div>
+
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<script>
+var DATA  = {{ insights_agg | tojson }};
+var META  = {{ insights_meta | tojson }};
+var YEARS = {{ years | tojson }};
+
+var curMetric  = 'pe';
+var curYearIdx = YEARS.length - 1;
+
+// Slider
+var sl = document.getElementById('yr-focus');
+sl.max   = YEARS.length - 1;
+sl.value = curYearIdx;
+document.getElementById('yr-focus-lbl').textContent = YEARS[curYearIdx];
+sl.addEventListener('input', function(){
+  curYearIdx = +this.value;
+  document.getElementById('yr-focus-lbl').textContent = YEARS[curYearIdx];
+  renderDist(); updateTSShape(); updateStats();
+});
+
+// Metric tabs
+document.querySelectorAll('.mtab').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    document.querySelectorAll('.mtab').forEach(function(b){ b.classList.remove('active'); });
+    btn.classList.add('active');
+    curMetric = btn.dataset.m;
+    renderTS(); renderDist(); updateStats();
+  });
+});
+
+// ── Shared Plotly config ──────────────────────────────────────────────────────
+var BASE = {
+  paper_bgcolor:'#fff', plot_bgcolor:'#fff',
+  font:{color:'#333',size:10,family:'Garamond,Georgia,serif'},
+  margin:{l:48,r:16,t:12,b:36},
+  hovermode:'x unified',
+  hoverlabel:{bgcolor:'#fff',bordercolor:'#ccc',font:{color:'#111',size:11}},
+  xaxis:{gridcolor:'#eee',linecolor:'#ccc',tickfont:{size:10},zeroline:false},
+  yaxis:{gridcolor:'#eee',linecolor:'#ccc',tickfont:{size:10},zeroline:false},
+  showlegend:false,
+};
+var CFG = {responsive:true, displayModeBar:false};
+
+function layout(extra){ return Object.assign({}, BASE, extra); }
+
+// ── Value formatting ──────────────────────────────────────────────────────────
+function fmt(m, v){
+  if(v==null) return '—';
+  var u = META[m] ? META[m].unit : '';
+  if(u==='%') return (v*100).toFixed(1)+'%';
+  if(u==='x') return v.toFixed(1)+'×';
+  return v.toFixed(2);
+}
+function suffix(m){ var u=META[m]&&META[m].unit; return u==='%'?'%':u==='x'?'×':''; }
+function isPercent(m){ return META[m]&&META[m].unit==='%'; }
+
+function scale(m, v){ return (v!=null && isPercent(m)) ? v*100 : v; }
+function scaleArr(m, arr){ return arr.map(function(v){ return scale(m,v); }); }
+
+// ── Time-series chart ─────────────────────────────────────────────────────────
+function renderTS(){
+  var m=curMetric, yrs=YEARS;
+  var meds=[], p25s=[], p75s=[];
+  yrs.forEach(function(y){
+    var d=DATA[y][m];
+    meds.push(scale(m, d?d.med:null));
+    p25s.push(scale(m, d?d.p25:null));
+    p75s.push(scale(m, d?d.p75:null));
+  });
+
+  var traces=[];
+  if(p25s.some(function(v){return v!=null;})){
+    var xf=yrs.concat(yrs.slice().reverse());
+    var yf=p75s.concat(p25s.slice().reverse());
+    traces.push({type:'scatter',x:xf,y:yf,fill:'toself',
+      fillcolor:'rgba(0,0,0,.05)',line:{color:'transparent'},
+      showlegend:false,hoverinfo:'skip'});
+  }
+  traces.push({
+    type:'scatter',x:yrs,y:meds,mode:'lines+markers',
+    line:{color:'#333',width:2},marker:{size:4,color:'#333'},
+    name:META[m]?META[m].label:m,
+    hovertemplate:'%{x}: %{y:.2f}'+suffix(m)+'<extra></extra>',
+  });
+
+  Plotly.react('chart-ts', traces, layout({
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:false,
+           title:{text:META[m]?META[m].yaxis:'',font:{color:'#6e7681',size:9}},
+           ticksuffix:suffix(m)},
+    shapes:[yearLine()],
+  }), CFG);
+}
+
+function yearLine(){
+  return {type:'line',x0:YEARS[curYearIdx],x1:YEARS[curYearIdx],
+          y0:0,y1:1,yref:'paper',
+          line:{color:'rgba(0,0,0,.3)',width:1,dash:'dot'}};
+}
+function updateTSShape(){ Plotly.relayout('chart-ts',{shapes:[yearLine()]}); }
+
+// ── Distribution chart ────────────────────────────────────────────────────────
+function renderDist(){
+  var m=curMetric, yr=YEARS[curYearIdx];
+  document.getElementById('dist-yr').textContent=yr;
+  var d=DATA[yr][m];
+
+  if(m==='prof'){
+    var rate=d?d.med:null;
+    Plotly.react('chart-dist',[{
+      type:'bar',x:['Profitable','Unprofitable'],
+      y:rate!=null?[rate*100,(1-rate)*100]:[0,0],
+      marker:{color:['#3fb950','#f85149'],opacity:.75},
+      hovertemplate:'%{x}: %{y:.1f}%<extra></extra>',
+    }], layout({
+      yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+             tickfont:{size:10},zeroline:false,ticksuffix:'%',range:[0,100]},
+      bargap:.2,
+    }), CFG);
+    return;
+  }
+
+  if(!d||!d.hist||!META[m]||!META[m].bins){
+    Plotly.react('chart-dist',[],layout({}),CFG); return;
+  }
+
+  var bins=META[m].bins, counts=d.hist;
+  var xl=[];
+  for(var i=0;i<bins.length-1;i++){
+    var mid=(bins[i]+bins[i+1])/2;
+    xl.push(isPercent(m)?(mid*100).toFixed(0)+'%':mid.toFixed(1)+(suffix(m)||''));
+  }
+
+  var med=d.med;
+  var binIdx=0;
+  if(med!=null){
+    for(var j=0;j<bins.length-1;j++){
+      if(med>=bins[j]&&med<bins[j+1]){binIdx=j;break;}
+    }
+  }
+
+  var barColors=counts.map(function(_,i){
+    return i===binIdx?'#333':'#bbb';
+  });
+
+  Plotly.react('chart-dist',[
+    {type:'bar',x:xl,y:counts,marker:{color:barColors,opacity:.75},
+     hovertemplate:'%{x}: %{y} companies<extra></extra>'},
+  ], layout({
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:false,
+           title:{text:'companies',font:{color:'#6e7681',size:9}}},
+    xaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:9},zeroline:false,tickangle:-35},
+    bargap:.06,margin:{l:48,r:16,t:12,b:50},
+  }), CFG);
+}
+
+// ── Small-cap margin collapse ─────────────────────────────────────────────────
+function renderTierMargin(){
+  var tiers=[
+    {k:'nano',   label:'<$10M',      color:'#6e7681'},
+    {k:'small',  label:'$10M–$100M', color:'#8b949e'},
+    {k:'mid',    label:'$100M–$1B',  color:'#58a6ff'},
+    {k:'large',  label:'$1B–$10B',   color:'#3fb950'},
+    {k:'mega',   label:'>$10B',      color:'#ffa657'},
+  ];
+  var traces=tiers.map(function(t){
+    return {
+      type:'scatter', name:t.label, x:YEARS,
+      y:YEARS.map(function(y){ var v=DATA[y].tier_margin[t.k]; return v!=null?v*100:null; }),
+      mode:'lines', line:{color:t.color,width:t.k==='nano'||t.k==='small'?2:1.5},
+      hovertemplate:t.label+': %{y:.1f}%<extra></extra>',
+    };
+  });
+  Plotly.react('chart-tier-margin', traces, layout({
+    showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},
+            bgcolor:'transparent',borderwidth:0},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:true,zerolinecolor:'#ccc',
+           ticksuffix:'%',title:{text:'Median Net Margin',font:{color:'#6e7681',size:9}}},
+    margin:{l:52,r:16,t:10,b:52},
+    shapes:[{type:'line',x0:YEARS[0],x1:YEARS[YEARS.length-1],y0:0,y1:0,
+             line:{color:'rgba(255,255,255,.1)',width:1}}],
+  }), CFG);
+}
+
+// ── Revenue universe tiers ─────────────────────────────────────────────────────
+function renderTiers(){
+  var tiers=[
+    {k:'nano',  label:'<$10M',      color:'#e0e0e0'},
+    {k:'small', label:'$10–100M',   color:'#aaa'},
+    {k:'mid',   label:'$100M–$1B',  color:'#777'},
+    {k:'large', label:'$1B–$10B',   color:'#444'},
+    {k:'mega',  label:'>$10B',      color:'#111'},
+  ];
+  var traces=tiers.map(function(t){
+    return {
+      type:'bar', name:t.label, x:YEARS,
+      y:YEARS.map(function(y){ return DATA[y].tiers[t.k]||0; }),
+      marker:{color:t.color}, hovertemplate:t.label+': %{y}<extra></extra>',
+    };
+  });
+  Plotly.react('chart-tiers', traces, layout({
+    barmode:'stack',showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},
+            bgcolor:'transparent',borderwidth:0},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:false,
+           title:{text:'companies',font:{color:'#6e7681',size:9}}},
+    margin:{l:52,r:16,t:10,b:52},
+  }), CFG);
+}
+
+// ── Fallen angels / risen stars ───────────────────────────────────────────────
+function renderFallen(){
+  var fallen=YEARS.map(function(y){ return DATA[y].fallen||0; });
+  var risen=YEARS.map(function(y){ return DATA[y].risen||0; });
+  Plotly.react('chart-fallen',[
+    {type:'bar',name:'Fallen angels',x:YEARS,y:fallen,
+     marker:{color:'#c00'},hovertemplate:'Fallen: %{y}<extra></extra>'},
+    {type:'bar',name:'Risen stars',x:YEARS,y:risen,
+     marker:{color:'#060'},hovertemplate:'Risen: %{y}<extra></extra>'},
+  ], layout({
+    barmode:'group',showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},
+            bgcolor:'transparent',borderwidth:0},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:false,
+           title:{text:'companies',font:{color:'#6e7681',size:9}}},
+    margin:{l:52,r:16,t:10,b:52},
+    annotations:[{x:2020,y:582,text:'COVID',showarrow:true,arrowhead:0,
+                  arrowcolor:'rgba(255,255,255,.3)',font:{size:9,color:'#555'},
+                  ax:0,ay:-20}],
+  }), CFG);
+}
+
+// ── IPO cohort quality ────────────────────────────────────────────────────────
+function renderCohort(){
+  // Cohort data mined by agent: median net margin by (cohort year, age 0-5)
+  var cohorts = {
+    2011: {0:0.013,1:0.018,2:0.023,3:0.025,4:0.023,5:0.023},
+    2013: {0:-0.101,1:-0.068,2:-0.078,3:-0.015,4:-0.040,5:-0.026},
+    2015: {0:-0.175,1:-0.161,2:-0.065,3:-0.062,4:-0.078,5:-0.088},
+    2017: {0:-0.054,1:-0.033,2:-0.030,3:-0.186,4:-0.055,5:-0.028},
+    2019: {0:-0.156,1:-0.172,2:-0.119,3:-0.125,4:-0.080,5:-0.071},
+    2021: {0:-0.261,1:-0.338,2:-0.270,3:-0.212,4:-0.153,5:-0.284},
+  };
+  var colors = {2011:'#aaa',2013:'#888',2015:'#aaa',2017:'#555',2019:'#333',2021:'#c00'};
+  var ages = [0,1,2,3,4,5];
+  var traces = Object.keys(cohorts).map(function(cy){
+    return {
+      type:'scatter',mode:'lines+markers',name:'Class of '+cy,
+      x:ages, y:ages.map(function(a){ return cohorts[cy][a]*100; }),
+      line:{color:colors[cy],width:cy=='2021'?2.5:1.5},
+      marker:{size:cy=='2021'?5:3,color:colors[cy]},
+      hovertemplate:'Class '+cy+' age %{x}: %{y:.1f}%<extra></extra>',
+    };
+  });
+  Plotly.react('chart-cohort', traces, layout({
+    showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},
+            bgcolor:'transparent',borderwidth:0},
+    xaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:false,title:{text:'years since IPO',font:{color:'#6e7681',size:9}},
+           tickvals:[0,1,2,3,4,5]},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:true,zerolinecolor:'#ccc',
+           ticksuffix:'%',title:{text:'Median Net Margin',font:{color:'#6e7681',size:9}}},
+    margin:{l:52,r:16,t:10,b:52},
+    annotations:[{x:1,y:-33.8,text:'2021 cohort digs deeper',showarrow:true,
+                  arrowhead:0,arrowcolor:'rgba(248,81,73,.5)',
+                  font:{size:9,color:'#c00'},ax:30,ay:-15}],
+  }), CFG);
+}
+
+// ── Stat row ──────────────────────────────────────────────────────────────────
+var ANNOTATIONS = {
+  nm: {2020:{val:'⚠ COVID',lbl:'Median NM near zero'},2022:{val:'−47%',lbl:'Small caps cratered to −74%'}},
+  cta:{2020:{val:'+47%',lbl:'Cash hoarding spike vs 2019'},2021:{val:'peak',lbl:'Highest corporate cash reserves'}},
+  rg: {2021:{val:'+13%',lbl:'Strongest growth since 2010'},2020:{val:'−2%',lbl:'First negative median growth'}},
+  pe: {2021:{val:'wide IQR',lbl:'SPAC/bubble valuation dispersion'},2009:{val:'13×',lbl:'Post-crisis trough'}},
+  prof:{2020:{val:'40%',lbl:'Lowest profitability ever (COVID)'},2021:{val:'47%',lbl:'Mass new entrants, many unprofitable'}},
+};
+function updateStats(){
+  var m=curMetric, yr=YEARS[curYearIdx];
+  var d=DATA[yr][m], cnt=DATA[yr].count;
+  var stats=[
+    {val:String(yr), lbl:'Focus Year'},
+    {val:cnt?cnt.toLocaleString():'—', lbl:'Companies'},
+  ];
+  if(d){
+    stats.push({val:fmt(m,d.med), lbl:'Median '+((META[m]&&META[m].label)||m)});
+    if(d.p25!=null&&d.p75!=null)
+      stats.push({val:fmt(m,d.p25)+' – '+fmt(m,d.p75), lbl:'IQR 25th–75th'});
+  }
+  var ann=(ANNOTATIONS[m]||{})[yr];
+  if(ann) stats.push({val:ann.val, lbl:ann.lbl});
+
+  document.getElementById('stat-row').innerHTML=stats.map(function(s){
+    return '<div class="stat"><span class="stat-val">'+s.val+'</span><span class="stat-lbl">'+s.lbl+'</span></div>';
+  }).join('');
+}
+
+// ── Growth→PE inversion ───────────────────────────────────────────────────────────────────────────
+function renderGrowthPE(){
+  var deciles=[0,1,2,3,4,5,6,7,8,9];
+  var pre2015=[10.8,11.9,12.4,13.1,13.8,14.2,14.6,14.9,15.1,15.4];
+  var post2020=[12.6,13.4,14.1,15.0,15.4,15.8,15.5,15.1,14.2,12.4];
+  Plotly.react('chart-growth-pe',[
+    {type:'scatter',mode:'lines+markers',name:'2010–2014 (growth rewarded)',
+     x:deciles,y:pre2015,line:{color:'#555',width:2},marker:{size:5,color:'#555'},
+     hovertemplate:'Pre-2015 decile %{x}: %{y:.1f}×<extra></extra>'},
+    {type:'scatter',mode:'lines+markers',name:'2020–2024 (growth punished)',
+     x:deciles,y:post2020,line:{color:'#c00',width:2},marker:{size:5,color:'#c00'},
+     hovertemplate:'2020–2024 decile %{x}: %{y:.1f}×<extra></extra>'},
+  ], layout({
+    showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},bgcolor:'transparent',borderwidth:0},
+    xaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',tickfont:{size:10},zeroline:false,
+           title:{text:'Revenue growth decile (0=slowest, 9=fastest)',font:{color:'#6e7681',size:9}},
+           tickvals:[0,1,2,3,4,5,6,7,8,9]},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',tickfont:{size:10},zeroline:false,
+           ticksuffix:'×',title:{text:'Median next-year P/E',font:{color:'#6e7681',size:9}}},
+    margin:{l:52,r:16,t:10,b:52},
+    annotations:[
+      {x:9,y:15.6,text:'2010–14 rho=+0.12',showarrow:false,font:{size:9,color:'#555'},xanchor:'right'},
+      {x:9,y:12.1,text:'2022 rho=−0.08',showarrow:false,font:{size:9,color:'#c00'},xanchor:'right'},
+    ],
+  }), CFG);
+}
+
+// ── New entrant quality ───────────────────────────────────────────────────────────────
+function renderEntrant(){
+  var eYears=[2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025];
+  var eMed  =[7.3, 6.5, 1.3,-0.9,-10.1,-20.0,-17.5,-19.7,-5.4,-14.1,-15.6,-29.8,-26.1,-53.1,-51.1,-21.1,-8.4];
+  var eProf =[79,  79,  49,  37,  28,   24,   27,   29,   32,  27,   24,   17,   13,   10,   19,   23,   23];
+  Plotly.react('chart-entrant',[
+    {type:'bar',name:'% Profitable at entry',x:eYears,y:eProf,yaxis:'y2',
+     marker:{color:'rgba(0,120,0,.25)'},hovertemplate:'%{x}: %{y}% profitable<extra></extra>'},
+    {type:'scatter',mode:'lines+markers',name:'Median first-year margin',
+     x:eYears,y:eMed,line:{color:'#333',width:2},marker:{size:4,color:'#333'},
+     hovertemplate:'%{x}: %{y:.1f}%<extra></extra>'},
+  ], layout({
+    showlegend:true,
+    legend:{orientation:'h',x:0,y:-0.18,font:{size:9,color:'#555'},bgcolor:'transparent',borderwidth:0},
+    xaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',tickfont:{size:10},zeroline:false},
+    yaxis:{gridcolor:'rgba(255,255,255,.04)',linecolor:'rgba(255,255,255,.08)',
+           tickfont:{size:10},zeroline:true,zerolinecolor:'#ccc',
+           ticksuffix:'%',title:{text:'Median first-year margin',font:{color:'#6e7681',size:9}}},
+    yaxis2:{overlaying:'y',side:'right',tickfont:{size:10},zeroline:false,
+            ticksuffix:'%',range:[0,110],title:{text:'% profitable',font:{color:'#6e7681',size:9}},
+            gridcolor:'transparent',linecolor:'rgba(255,255,255,.08)'},
+    margin:{l:52,r:52,t:10,b:52},barmode:'overlay',
+    annotations:[{x:2022,y:-55,text:'2022: 10% profitable',showarrow:true,
+                  arrowhead:0,arrowcolor:'#c00',
+                  font:{size:9,color:'#c00'},ax:0,ay:-16}],
+  }), CFG);
+}
+
+// ── Annotation bar ─────────────────────────────────────────────────────────────────────────────
+var INSIGHTS_TEXT = [
+  '<span class="tag">Insight</span><b>Small-cap margin collapse:</b> Median net margin for sub-$10M companies fell from -5% in 2009 to -78% in 2023. Large caps held at 5-9% throughout. Secular, not cyclical.',
+  '<span class="tag">Insight</span><b>Growth premium inverted after 2020:</b> Pre-2015, fastest growers commanded highest P/E (rho=+0.12). By 2022 that flipped (rho=-0.08, p=0.001). Hyper-growth now trades cheaper than moderate growers.',
+  '<span class="tag">Insight</span><b>The 2021 cohort never heals:</b> Every prior IPO cohort improved margins as it aged. The 924-company 2021 class started at -26% and hit -34% at age 1 with no recovery. The ZIRP bubble in a single line.',
+  '<span class="tag">Insight</span><b>New entrant quality collapsed:</b> 2009-10: 79% of new filers profitable year one. 2022 cohort: 10%, median margin -53%. Zombie company count at a 15-year high of 290 firms.',
+];
+var _annIdx = 0;
+document.getElementById('ann-bar').innerHTML = INSIGHTS_TEXT[0];
+setInterval(function(){
+  _annIdx = (_annIdx+1)%INSIGHTS_TEXT.length;
+  document.getElementById('ann-bar').innerHTML = INSIGHTS_TEXT[_annIdx];
+}, 6000);
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.getElementById('nav-sub').textContent =
+  YEARS[0]+'–'+YEARS[YEARS.length-1]+' · '+
+  Object.values(DATA).reduce(function(s,d){return s+(d.count||0);},0).toLocaleString()+
+  ' company-years';
+
+renderTS();
+renderDist();
+renderTierMargin();
+renderTiers();
+renderFallen();
+renderCohort();
+renderGrowthPE();
+renderEntrant();
+updateStats();
+</script>
+</body>
+</html>"""
+
+
 if __name__ == "__main__":
-    print("Starting EDGAR Market Manifold at http://localhost:5001")
+    print("Starting EDGAR Market Visualizer at http://localhost:5001")
     app.run(debug=False, host="127.0.0.1", port=5001, threaded=True)

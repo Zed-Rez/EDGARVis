@@ -27,7 +27,14 @@ OUTPUT = Path("/Users/rezaramji/Documents/CCC/EDGARmaxxing/metrics.parquet")
 
 # us-gaap field priority lists (first non-empty result wins)
 GAAP_FIELDS = {
-    "net_income":     ["NetIncomeLoss"],
+    "net_income":     [
+        "NetIncomeLoss",
+        # Consolidated net income including non-controlling interest (identical to
+        # NetIncomeLoss for companies without subsidiaries)
+        "ProfitLoss",
+        # Net income after preferred dividends — close proxy when the above are absent
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+    ],
     "revenue":        [
         "Revenues",
         "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -35,22 +42,53 @@ GAAP_FIELDS = {
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
         "SalesRevenueServicesNet",
+        # Sector-specific top-line revenue
         "OilAndGasRevenue",
+        "OilAndGasSalesRevenue",
         "RealEstateRevenueNet",
         "OtherSalesRevenueNet",
-        # Financial sector: banks use net interest income + non-interest income
+        "RegulatedAndUnregulatedOperatingRevenue",   # utilities
+        "ElectricUtilityRevenue",                    # electric utilities
+        "GasGatheringTransportationMarketingAndProcessingRevenue",  # gas utilities
+        "HealthCareOrganizationRevenue",             # hospitals / health systems
+        "OperatingLeasesIncomeStatementLeaseRevenue", # REITs / lessors
+        # Banks: net interest income + fee income
         "InterestAndDividendIncomeOperating",
         "NoninterestIncome",
-        # Insurers
+        "InterestAndFeeIncomeLoansAndLeases",
+        # Investment banks: net revenues (interest income net of funding cost)
+        "RevenuesNetOfInterestExpense",
+        # Insurers: premiums + net investment income
         "PremiumsEarnedNet",
+        "NetInvestmentIncome",
+        # Investment companies (BDCs, closed-end funds): net investment income
+        # is their functional equivalent of revenue. Added last so operating-company
+        # revenue tags always win for years where both exist.
+        "InvestmentIncomeNet",
+        "InvestmentIncomeInterest",
     ],
     "assets":         ["Assets"],
-    "equity":         ["StockholdersEquity", "StockholdersEquityAttributableToParent"],
-    "op_cash":        ["NetCashProvidedByUsedInOperatingActivities"],
+    "equity":         [
+        "StockholdersEquity",
+        "StockholdersEquityAttributableToParent",
+        # Total equity including minority interest — identical for most companies
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        # Limited partnerships / MLPs
+        "PartnersCapital",
+        # LLCs (pipelines, utilities, subsidiaries) — exact equivalent of stockholders equity
+        "MembersEquity",
+        "MembersCapital",
+    ],
+    "op_cash":        [
+        "NetCashProvidedByUsedInOperatingActivities",
+        # Continuing-ops variant filed when discontinued operations are split out
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ],
     "op_income":      [
         "OperatingIncomeLoss",
-        # Pre-tax operating proxy used by financials/insurers that omit OperatingIncomeLoss
+        # Pre-tax proxies: newer and older GAAP wording for the same concept
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
     ],
     "long_term_debt": [
         "LongTermDebt",
@@ -61,6 +99,12 @@ GAAP_FIELDS = {
     "cash":           [
         "CashAndCashEquivalentsAtCarryingValue",
         "CashCashEquivalentsAndShortTermInvestments",
+        # Post-2016 ASC 230 balance sheet line includes restricted cash
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        # Simple "Cash" tag used by some older or smaller filers
+        "Cash",
+        # Bank-specific: cash + fed funds sold
+        "CashCashEquivalentsAndFederalFundsSold",
     ],
     "gross_profit":   ["GrossProfit"],
 }
@@ -86,8 +130,11 @@ def extract_annual_gaap(entries: list, is_flow: bool = False) -> dict:
       1. |end_year - fy| <= 1  — rejects comparative periods re-filed under a
          later fiscal year (e.g. Apple filing FY2017 revenue inside its FY2019 10-K
          produces fy=2019, end=2017-09-30; the gap of 2 drops it).
-      2. is_flow + duration >= 300 days — rejects quarterly sub-periods that appear
-         with fp='FY' as comparative line items.
+      2. is_flow + 300 <= duration <= 550 days — rejects both quarterly sub-periods
+         (< 300 days) AND inception-to-date cumulative statements that development-
+         stage companies file alongside their annual figures (duration >> 366 days).
+         550-day ceiling allows for unusually long fiscal year transitions while
+         excluding multi-year cumulative periods (e.g. 16,400-day since-1967 entry).
     """
     best = {}  # fy -> (filed_str, val)
     for entry in entries:
@@ -122,14 +169,18 @@ def extract_annual_gaap(entries: list, is_flow: bool = False) -> dict:
         if abs(end_year - fy) > 1:
             continue
 
-        # Guard 2: flow metrics must cover a full year (>= 300 days)
+        # Guard 2: flow metrics must cover a full year (300–550 days).
+        # Lower bound rejects quarterly sub-periods; upper bound rejects
+        # inception-to-date cumulative statements filed by development-stage
+        # companies (e.g. start=1967-05-26, end=2012-04-30 = 16,400 days).
         if is_flow:
             start_str = entry.get("start", "")
             if start_str and len(start_str) >= 10 and len(end_str) >= 10:
                 try:
                     s = date.fromisoformat(start_str[:10])
                     e = date.fromisoformat(end_str[:10])
-                    if (e - s).days < 300:
+                    dur = (e - s).days
+                    if dur < 300 or dur > 550:
                         continue
                 except ValueError:
                     pass
@@ -253,9 +304,58 @@ def process_file(path: Path) -> list:
     gaap = facts.get("us-gaap", {})
     dei  = facts.get("dei", {})
 
-    # Extract {metric: {fy: val}} for each namespace
-    gaap_data = coalesce_fields(gaap, GAAP_FIELDS, extract_annual_gaap, flow_set=FLOW_METRIC_NAMES)
+    # ── Revenue: two-phase extraction ──────────────────────────────────────────
+    # InvestmentIncomeNet / InvestmentIncomeInterest are valid revenue proxies
+    # for pure investment companies (BDCs, closed-end funds, etc.) that have
+    # no other revenue concept.  But for operating companies that simply stopped
+    # tagging their revenue in XBRL after a restructuring (e.g. Apache Corp
+    # dropped OilAndGasRevenue post-2017 but still earns billions), those tags
+    # would silently replace real revenue with a tiny interest-income figure.
+    # Fix: only allow investment-income tags when the company has ZERO primary
+    # revenue data in any year.
+    _INVEST_REV = {"InvestmentIncomeNet", "InvestmentIncomeInterest"}
+    _primary_rev_tags = [t for t in GAAP_FIELDS["revenue"] if t not in _INVEST_REV]
+    _gaap_fields_primary = {**GAAP_FIELDS, "revenue": _primary_rev_tags}
+    gaap_data = coalesce_fields(gaap, _gaap_fields_primary, extract_annual_gaap, flow_set=FLOW_METRIC_NAMES)
+
+    if not gaap_data.get("revenue"):
+        # No primary revenue at all — allow investment income as a last resort
+        invest_rev = coalesce_fields(
+            gaap,
+            {"revenue": list(_INVEST_REV)},
+            extract_annual_gaap,
+            flow_set=FLOW_METRIC_NAMES,
+        )
+        gaap_data["revenue"] = invest_rev.get("revenue", {})
+    # ───────────────────────────────────────────────────────────────────────────
+
     dei_data  = coalesce_fields(dei,  DEI_FIELDS,  extract_annual_dei)
+
+    # Fallback cascade for shares_outstanding:
+    #   1. EntityCommonStockSharesOutstanding (DEI) — already in DEI_FIELDS
+    #   2. CommonStockSharesOutstanding (GAAP) — point-in-time, preferred over weighted avg
+    #   3. LimitedPartnersCapitalAccountUnitsOutstanding — LP/MLP unit count
+    #   4. WeightedAverageNumberOfSharesOutstandingBasic — approximation (period average)
+    #   5. WeightedAverageNumberOfShareOutstandingBasicAndDiluted — single-class companies
+    _sh_fallbacks = [
+        "CommonStockSharesOutstanding",
+        "LimitedPartnersCapitalAccountUnitsOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+    ]
+    existing = dei_data.get("shares_outstanding", {})
+    for fb_tag in _sh_fallbacks:
+        if fb_tag not in gaap:
+            continue
+        gaap_sh = coalesce_fields(
+            gaap,
+            {"shares_outstanding": [fb_tag]},
+            extract_annual_dei,
+        )
+        for fy, val in gaap_sh.get("shares_outstanding", {}).items():
+            if fy not in existing:
+                existing[fy] = val
+    dei_data["shares_outstanding"] = existing
 
     # Merge: collect all fiscal years mentioned across all metrics
     all_fys = set()
@@ -279,6 +379,18 @@ def process_file(path: Path) -> list:
         for metric in DEI_FIELDS:
             val = dei_data.get(metric, {}).get(fy, np.nan)
             row[metric] = float(val) if val is not None and not _is_nan(val) else np.nan
+
+        # ── Field-level sanity constraints applied at extraction time ───────
+        # Revenue is definitionally non-negative; negative values arise from
+        # investment-loss tags or EDGAR filing errors.
+        if not _is_nan(row.get("revenue", np.nan)) and row["revenue"] < 0:
+            row["revenue"] = np.nan
+        # Cash cannot be negative.
+        if not _is_nan(row.get("cash", np.nan)) and row["cash"] < 0:
+            row["cash"] = np.nan
+        # shares_outstanding = 0 is meaningless (LLCs, pre-IPO shells); NaN.
+        if not _is_nan(row.get("shares_outstanding", np.nan)) and row["shares_outstanding"] == 0:
+            row["shares_outstanding"] = np.nan
 
         # Coverage filter: at least 3 of the 5 key fields must be non-NaN
         non_nan_count = sum(

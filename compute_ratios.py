@@ -113,7 +113,14 @@ def compute_umap(df: pd.DataFrame) -> pd.DataFrame:
     # deviation.
     # ------------------------------------------------------------------
     K_NEIGHBORS = 15
-    EPS = 1e-9
+    # EPS floors the neighbourhood std to prevent z-score explosion when all
+    # K neighbours have identical (NaN-filled median) feature values.
+    # With RobustScaler, typical inter-neighbour std is 0.1–2; a floor of 0.1
+    # bounds z-scores realistically. z-scores are also hard-clipped at ±10
+    # (10σ from local mean is already extreme) so manifold_distance stays
+    # in a human-interpretable range (~0–30) rather than blowing up to 1e9.
+    EPS = 0.1
+    Z_CLIP = 10.0
     dev_feature_names = [
         "log_revenue", "log_public_float", "net_margin", "op_margin",
         "revenue_growth", "debt_to_equity", "roe", "op_cash_yield",
@@ -146,7 +153,10 @@ def compute_umap(df: pd.DataFrame) -> pd.DataFrame:
             nbr_features  = scaled2[neighbor_idxs]           # (K, n_features)
             nbr_mean      = nbr_features.mean(axis=0)
             nbr_std       = nbr_features.std(axis=0)
-            z_scores      = (scaled2[i] - nbr_mean) / (nbr_std + EPS)
+            z_scores      = np.clip(
+                (scaled2[i] - nbr_mean) / (nbr_std + EPS),
+                -Z_CLIP, Z_CLIP,
+            )
             manifold_dist[i] = float(np.sqrt((z_scores ** 2).sum()))
             dev_matrix[i]    = z_scores
 
@@ -172,6 +182,37 @@ def main():
     df["long_term_debt"] = df["long_term_debt"].where(
         df["long_term_debt"].notna() | ~has_balance_sheet, 0.0
     )
+
+    # ── Revenue non-negative filter ────────────────────────────────────────
+    # Revenue is definitionally >= 0. Negative values come from investment
+    # companies where NetInvestmentIncome / InvestmentIncomeNet went negative
+    # (losses > income), or from rare EDGAR filing errors in the Revenues tag.
+    # In both cases NaN is more honest than a negative revenue figure.
+    n_neg_rev = (df["revenue"] < 0).sum()
+    df.loc[df["revenue"] < 0, "revenue"] = np.nan
+    print(f"  revenue < 0: nulled {n_neg_rev} rows")
+
+    # ── shares_outstanding zero filter ──────────────────────────────────────
+    # Zero shares is valid for LLCs and pre-IPO holding periods, but for
+    # companies that are clearly operating (assets > 0), zero usually means
+    # a weighted-average rounding artefact or a wrong tag. NaN is safer.
+    n_zero_sh = (df["shares_outstanding"] == 0).sum()
+    df.loc[df["shares_outstanding"] == 0, "shares_outstanding"] = np.nan
+    print(f"  shares_outstanding == 0: nulled {n_zero_sh} rows")
+
+    # ── public_float sanity filter ──────────────────────────────────────────
+    # EntityPublicFloat is sometimes mis-filed in wrong units or with overflow
+    # sentinel values (e.g. exactly 1e18, or 1000x the real value).
+    # Hard cap: Apple's all-time peak was ~$3.7T; anything above $5T is wrong.
+    MAX_PF = 5e12
+    pf_bad = df["public_float"] > MAX_PF
+    # Ratio check: public_float > 1000x revenue for companies with >$100M revenue
+    # catches cases that are below the hard cap but still clearly mis-filed.
+    has_real_rev = df["revenue"].notna() & (df["revenue"] > 1e8)
+    pf_ratio_bad = has_real_rev & (df["public_float"] / df["revenue"].clip(lower=1) > 1000)
+    n_fixed = (pf_bad | pf_ratio_bad).sum()
+    df.loc[pf_bad | pf_ratio_bad, "public_float"] = np.nan
+    print(f"  public_float sanity: nulled {n_fixed} mis-filed rows")
 
     # ------------------------------------------------------------------ #
     # 1. Basic ratio columns                                               #
